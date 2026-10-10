@@ -165,7 +165,8 @@ ENV JAVA_HOME=/usr/lib/jvm/java
 ENV PATH=$JAVA_HOME/bin:$PATH
 
 # 准备 Kafka 二进制 (build-jsa 阶段需要完整 Kafka 才能跑 jsa_launch)
-COPY launch jsa_launch /etc/kafka/docker/
+COPY jsa_launch /etc/kafka/docker/jsa_launch
+COPY launch     /etc/kafka/docker/launch
 COPY server.properties /etc/kafka/docker/server.properties
 # context 根由 workflow 预置了 kafka.tgz 占位文件 (touch docker/kafka.tgz),
 # 使本行 glob 能匹配; 真正的 tarball 由下面的 RUN 用 wget 覆盖下载。

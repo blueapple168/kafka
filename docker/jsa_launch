@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 生成 CDS 归档 (storage.jsa + kafka.jsa),供运行时 launch 以
+# -XX:SharedArchiveFile=/opt/kafka/{storage,kafka}.jsa 使用。
+#
+# 相对官方版本的修正:
+#   1. 所有 Kafka 脚本路径补上前导 `/` (官方原文写作 `opt/kafka/bin/...`,
+#      是相对当前工作目录的路径;在官方 alpine 镜像里 WORKDIR 恰好是 `/`,
+#      所以侥幸可用。UOS 版不能依赖此巧合,统一改为绝对路径 /opt/kafka/...)
+#   2. -XX:ArchiveClassesAtExit 输出到 /opt/kafka/{storage,kafka}.jsa ——
+#      这正是运行时 launch 里 SharedArchiveFile 的查找位置,
+#      也是 Dockerfile Stage 2 `COPY --from=build-jsa <name>.jsa` 的基准目录。
+#   3. 显式设置 CLUSTER_ID,避免在 `set -o nounset` 类环境下因未定义而中断。
+#   4. 等待 jsa 落盘后校验,失败即非零退出,避免 Stage 2 COPY 时才暴露问题。
+set -eux
+
+KAFKA_HOME=/opt/kafka
+KAFKA_BIN="${KAFKA_HOME}/bin"
+KAFKA_CONF="${KAFKA_HOME}/config/server.properties"
+
+export CLUSTER_ID="${CLUSTER_ID:-$("${KAFKA_BIN}/kafka-storage.sh" random-uuid)}"
+TOPIC="test-topic"
+
+# 1) 用 storage 工具格式化 KRaft 存储,同时产出 storage.jsa
+KAFKA_JVM_PERFORMANCE_OPTS="-XX:ArchiveClassesAtExit=${KAFKA_HOME}/storage.jsa" \
+    "${KAFKA_BIN}/kafka-storage.sh" format --standalone -t "${CLUSTER_ID}" -c "${KAFKA_CONF}"
+
+# 2) 启动 broker,过程中产出 kafka.jsa
+KAFKA_JVM_PERFORMANCE_OPTS="-XX:ArchiveClassesAtExit=${KAFKA_HOME}/kafka.jsa" \
+    "${KAFKA_BIN}/kafka-server-start.sh" "${KAFKA_CONF}" &
+KAFKA_PID=$!
+
+# 3) 冒烟验证: 建 topic -> 生产 -> 消费
+"${KAFKA_BIN}/kafka-topics.sh" --create --topic "${TOPIC}" --bootstrap-server localhost:9092
+echo "test" | "${KAFKA_BIN}/kafka-console-producer.sh" --topic "${TOPIC}" --bootstrap-server localhost:9092
+"${KAFKA_BIN}/kafka-console-consumer.sh" --topic "${TOPIC}" --from-beginning \
+    --bootstrap-server localhost:9092 --max-messages 1 --timeout-ms 20000
+
+# 4) 优雅停服,促使 CDS 归档落盘
+kill -TERM "${KAFKA_PID}"
+wait "${KAFKA_PID}" || true
+
+# 5) 等待并校验两个 jsa 均已生成
+check_timeout() {
+    if [ "${TIMEOUT}" -le 0 ]; then
+        echo "Timed out waiting for jsa archive to be generated" >&2
+        exit 1
+    fi
+    echo "Waiting for jsa archive... timeout in $(( TIMEOUT-- ))s"
+    sleep 1
+}
+
+for jsa in storage.jsa kafka.jsa; do
+    TIMEOUT=60
+    until [ -s "${KAFKA_HOME}/${jsa}" ]; do
+        check_timeout
+    done
+    ls -l "${KAFKA_HOME}/${jsa}"
+done
+
+echo "CDS archives generated under ${KAFKA_HOME}: storage.jsa kafka.jsa"
