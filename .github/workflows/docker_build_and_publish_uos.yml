@@ -69,9 +69,15 @@ jobs:
       matrix:
         # variant 决定: Dockerfile 路径、默认 tag 后缀、是否校验 Temurin SHA256 secrets
         variant: [jvm, native]
+        # platform 作为独立维度: amd64 与 arm64 拆成不同 job,互不拖累。
+        # 原因: arm64 在 GitHub runner 上走 QEMU 模拟,访问 UOS 官方源
+        # (enterprise-c-packages.chinauos.com) 下载 aarch64 包时, 偶发
+        # SSL 断连(35)/空响应(52)/低速超时(28)。若与 amd64 同 job 双平台构建,
+        # arm64 失败会连带丢弃 amd64 已构建成果。拆开后各自独立重试。
+        platform: [linux/amd64, linux/arm64]
     concurrency:
-      # 不同 variant 独立,避免 jvm 与 native 构建互相 cancel
-      group: docker-publish-uos-${{ matrix.variant }}-${{ github.ref }}
+      # 不同 variant × platform 独立,避免互相 cancel
+      group: docker-publish-uos-${{ matrix.variant }}-${{ matrix.platform }}-${{ github.ref }}
       cancel-in-progress: true
     env:
       # Kafka 版本号集中维护: 升级 Kafka 时只需改这一处,
@@ -116,6 +122,13 @@ jobs:
           fi
           echo "tag=$image_tag" >> "$GITHUB_OUTPUT"
 
+          # 平台后缀: linux/amd64 -> amd64, linux/arm64 -> arm64
+          # 单平台 job 各自推 ${tag}-<arch>, 最后由 merge job 合成 multi-arch manifest
+          platform_arch="${{ matrix.platform }}"
+          platform_arch="${platform_arch##*/}"
+          echo "arch=$platform_arch" >> "$GITHUB_OUTPUT"
+          echo "arch_tag=${image_tag}-${platform_arch}" >> "$GITHUB_OUTPUT"
+
       # jvm 变体专属: 校验 Temurin tarball SHA256 secrets 已配置
       # native 变体不需要 Temurin (运行的是 AOT 原生二进制),跳过此步
       - name: Validate Temurin SHA256 secrets
@@ -134,16 +147,19 @@ jobs:
             exit 1
           fi
 
-      - name: Build and push (linux/amd64, linux/arm64)
+      - name: Build and push (${{ matrix.platform }})
+        id: build
         env:
           KAFKA_URL: ${{ steps.kafka-url.outputs.url }}
-          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
           JDK_TARBALL_SHA256_X86_64: ${{ secrets.JDK_TARBALL_SHA256_X86_64 }}
           JDK_TARBALL_SHA256_AARCH64: ${{ secrets.JDK_TARBALL_SHA256_AARCH64 }}
           JRE_TARBALL_SHA256_X86_64: ${{ secrets.JRE_TARBALL_SHA256_X86_64 }}
           JRE_TARBALL_SHA256_AARCH64: ${{ secrets.JRE_TARBALL_SHA256_AARCH64 }}
         run: |
           set -eux
+          # step outputs 用 shell 变量接收, 避免在 buildx 命令里反复内联插值出错
+          ARCH_TAG='${{ steps.image-tag.outputs.arch_tag }}'
+          echo "ARCH_TAG=${ARCH_TAG}"
           # Dockerfile-uos 里 `COPY *kafka.tgz` 要求 context 根存在该 glob 的匹配文件,
           # 但 tarball 是在 RUN 阶段用 wget 下载的 (COPY 早于 RUN)。
           # 因此构建前需要在 context 根放一个占位文件, 下载后会被覆盖/清理。
@@ -170,27 +186,36 @@ jobs:
             )
           fi
 
-          echo "::group::Building variant=${{ matrix.variant }} with ${dockerfile}"
+          echo "::group::Building variant=${{ matrix.variant }} platform=${{ matrix.platform }} with ${dockerfile}"
+          # 单平台构建, 推到带架构后缀的临时 tag; merge job 再合成 multi-arch manifest。
+          # --metadata-file 收集本次构建的 digest, 供 merge job 使用。
           docker buildx build \
             -f "${dockerfile}" \
             --build-arg "KAFKA_VERSION=${KAFKA_VERSION}" \
             --build-arg "kafka_url=${KAFKA_URL}" \
             "${extra_sha256_args[@]}" \
             --build-arg "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            --platform linux/amd64,linux/arm64 \
-            --tag "ghcr.io/blueapple168/kafka:${IMAGE_TAG}" \
+            --platform "${{ matrix.platform }}" \
+            --tag "ghcr.io/blueapple168/kafka:${ARCH_TAG}" \
+            --metadata-file "${GITHUB_WORKSPACE}/buildx-${ARCH_TAG}.json" \
             --push \
             docker/
           echo "::endgroup::"
+
+          # 记录 digest 到输出, 供 merge job 拼装 manifest 时引用
+          digest=$(jq -r '."containerimage.digest"' "${GITHUB_WORKSPACE}/buildx-${ARCH_TAG}.json")
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "arch_tag=${ARCH_TAG}" >> "$GITHUB_OUTPUT"
+          echo "::notice::${ARCH_TAG} -> ${digest}"
 
       - name: Run CVE scan (Trivy)
         uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
         with:
           scan-type: 'image'
-          scan-ref: 'ghcr.io/blueapple168/kafka:${{ steps.image-tag.outputs.tag }}'
+          scan-ref: 'ghcr.io/blueapple168/kafka:${{ steps.image-tag.outputs.arch_tag }}'
           format: 'table'
           severity: 'CRITICAL,HIGH'
-          output: 'scan_report_uos_${{ matrix.variant }}.txt'
+          output: 'scan_report_uos_${{ matrix.variant }}_${{ steps.image-tag.outputs.arch }}.txt'
           # exit-code: '1' 会在发现 CRITICAL/HIGH 时直接 fail 整个 job,
           # 且报告文件可能尚未落盘 -> 后续 Upload 步骤报 "No files were found"。
           # 改为 '0': 扫描结果只作为报告产出, 不阻断发布 (由人工审查).
@@ -200,6 +225,75 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan_report_uos_${{ matrix.variant }}.txt
-          path: scan_report_uos_${{ matrix.variant }}.txt
+          name: scan_report_uos_${{ matrix.variant }}_${{ steps.image-tag.outputs.arch }}.txt
+          path: scan_report_uos_${{ matrix.variant }}_${{ steps.image-tag.outputs.arch }}.txt
           if-no-files-found: warn
+
+  # 把各平台 job 推的 ${tag}-amd64 / ${tag}-arm64 合成最终 multi-arch manifest。
+  # 用 if: always() 而非依赖 needs 的默认成功语义: 这样某个 variant 的某个 arch
+  # 失败时, 不会连带阻止其它 variant 的 manifest 合并。
+  # 合并前显式检查两个 arch tag 是否都已存在于 registry, 缺一即跳过并给出提示。
+  merge-manifest:
+    if: ${{ always() && github.repository == 'blueapple168/kafka' }}
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [jvm, native]
+    env:
+      KAFKA_VERSION: '4.3.1'
+    steps:
+      - name: Resolve image tag
+        id: image-tag
+        run: |
+          image_tag="${{ github.event.inputs.image_tag }}"
+          if [ -z "$image_tag" ]; then
+            if [ "${{ matrix.variant }}" = "native" ]; then
+              image_tag="${KAFKA_VERSION}-native-uos"
+            else
+              image_tag="${KAFKA_VERSION}-uos"
+            fi
+          fi
+          echo "tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          set -eux
+          repo='ghcr.io/blueapple168/kafka'
+          image_tag='${{ steps.image-tag.outputs.tag }}'
+
+          # 逐个确认两个 arch tag 均已推送成功; 缺任一则跳过本 variant 的合并
+          # (另一个 variant 的 merge 仍会正常执行, 因为 job 之间相互独立)
+          missing=0
+          for arch in amd64 arm64; do
+            if ! docker buildx imagetools inspect "${repo}:${image_tag}-${arch}" >/dev/null 2>&1; then
+              echo "::warning::${repo}:${image_tag}-${arch} 不存在 (该平台构建可能失败), 跳过合并"
+              missing=1
+            fi
+          done
+          if [ "${missing}" = "1" ]; then
+            echo "::notice::variant=${{ matrix.variant }} 缺少平台镜像, 未生成 multi-arch manifest"
+            exit 0
+          fi
+
+          # 合成 linux/amd64 + linux/arm64 的 manifest list 到最终 tag
+          docker buildx imagetools create \
+            --tag "${repo}:${image_tag}" \
+            "${repo}:${image_tag}-amd64" \
+            "${repo}:${image_tag}-arm64"
+          echo "::notice::multi-arch manifest published: ${repo}:${image_tag}"
+          docker buildx imagetools inspect "${repo}:${image_tag}"

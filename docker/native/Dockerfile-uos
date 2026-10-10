@@ -80,10 +80,12 @@ COPY *kafka.tgz /app
 
 RUN set -eux; \
     if [ -n "$kafka_url" ]; then \
-        microdnf install -y wget gnupg2; \
-        wget -nv -O kafka.tgz "$kafka_url"; \
-        wget -nv -O kafka.tgz.asc "$kafka_url.asc"; \
-        wget -nv -O KEYS https://downloads.apache.org/kafka/KEYS; \
+        : "=== 安装下载工具 (microdnf 源偶发不稳, 失败重试一次) ===" ; \
+        microdnf install -y wget gnupg2 || { microdnf clean all; sleep 10; microdnf install -y wget gnupg2; }; \
+        : "=== 下载 Kafka tarball/签名/KEYS (带重试, 境外链路易断) ===" ; \
+        wget -nv --tries=5 --timeout=300 --waitretry=10 --retry-connrefused -O kafka.tgz "$kafka_url"; \
+        wget -nv --tries=5 --timeout=300 --waitretry=10 --retry-connrefused -O kafka.tgz.asc "$kafka_url.asc"; \
+        wget -nv --tries=5 --timeout=300 --waitretry=10 --retry-connrefused -O KEYS https://downloads.apache.org/kafka/KEYS; \
         gpg --import KEYS; \
         gpg --batch --verify kafka.tgz.asc kafka.tgz; \
     fi; \
@@ -132,20 +134,34 @@ RUN set -eux; \
     sed -i 's/Version: 39\.2\.0/Version: 2026.10.10/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
     \
     : "=== yum/dnf 网络调优：默认 timeout=30s 太短，minrate=1000 容易在低速链路上触发下载中止 ===" ; \
+    : "境外 runner (尤其 arm64 QEMU) 访问 UOS 官方源常出现 SSL 断连(35)/空响应(52)/低速超时(28)," ; \
+    : "故 minrate 放宽到 0 (不因低速中止), timeout 提到 600s, 并开启 curl 层重试" ; \
     if [ -f /etc/yum.conf ]; then \
         sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
         if grep -q '^\[main\]' /etc/yum.conf; then \
-            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+            sed -i '/^\[main\]/a timeout=600\nminrate=0\nretries=10' /etc/yum.conf; \
         else \
-            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+            printf '\n[main]\ntimeout=600\nminrate=0\nretries=10\n' >> /etc/yum.conf; \
         fi; \
     fi; \
-    yum makecache; \
     \
     : "=== 运行时依赖: native 二进制已静态链接 glibc,只需脚本与系统工具 ===" ; \
-    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        --setopt=timeout=300 --setopt=minrate=100 \
-        ca-certificates tar bash tzdata coreutils findutils shadow-utils hostname; \
+    : "带指数退避的重试循环: 最多 3 轮, 每轮 2 次尝试, 覆盖 makecache + install 全流程" ; \
+    pkgs='ca-certificates tar bash tzdata coreutils findutils shadow-utils hostname'; \
+    ok=0; \
+    for attempt in 1 2 3; do \
+        echo "::notice::yum 安装尝试 ${attempt}/3 (packages: ${pkgs})"; \
+        if yum makecache --setopt=timeout=600 --setopt=minrate=0 --setopt=retries=10 \
+           && yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+                --setopt=timeout=600 --setopt=minrate=0 --setopt=retries=10 \
+                ${pkgs}; then \
+            ok=1; echo "::notice::yum 安装成功 (尝试 ${attempt})"; break; \
+        fi; \
+        echo "::warning::yum 第 ${attempt} 轮失败, 清理缓存后重试"; \
+        yum clean all 2>/dev/null || true; rm -rf /var/cache/yum /var/cache/dnf 2>/dev/null || true; \
+        sleep $((attempt * 15)); \
+    done; \
+    if [ "${ok}" != "1" ]; then echo "::error::yum 安装 3 轮均失败"; exit 1; fi; \
     \
     yum clean all; \
     rm -rf /var/cache/yum /var/cache/dnf

@@ -90,20 +90,34 @@ RUN set -eux; \
     sed -i 's/Version: 39\.2\.0/Version: 2026.10.10/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
     \
     : "=== yum/dnf 网络调优：默认 timeout=30s 太短，minrate=1000 容易在低速链路上触发下载中止 ===" ; \
+    : "境外 runner (尤其 arm64 QEMU) 访问 UOS 官方源常出现 SSL 断连(35)/空响应(52)/低速超时(28)," ; \
+    : "故 minrate 放宽到 0 (不因低速中止), timeout 提到 600s, 并开启 curl 层重试" ; \
     if [ -f /etc/yum.conf ]; then \
         sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
         if grep -q '^\[main\]' /etc/yum.conf; then \
-            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+            sed -i '/^\[main\]/a timeout=600\nminrate=0\nretries=10' /etc/yum.conf; \
         else \
-            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+            printf '\n[main]\ntimeout=600\nminrate=0\nretries=10\n' >> /etc/yum.conf; \
         fi; \
     fi; \
-    yum makecache; \
     \
     : "=== 运行时依赖 (build-jsa 阶段也需要): ca-certificates (TLS)、wget/curl (下载)、tar/xz (解压)、findutils+coreutils、bash ===" ; \
-    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        --setopt=timeout=300 --setopt=minrate=100 \
-        ca-certificates tar xz wget curl bash procps gnupg2 findutils shadow-utils hostname; \
+    : "带指数退避的重试循环: 最多 3 轮, 覆盖 makecache + install 全流程" ; \
+    pkgs='ca-certificates tar xz wget curl bash procps gnupg2 findutils shadow-utils hostname'; \
+    ok=0; \
+    for attempt in 1 2 3; do \
+        echo "::notice::yum 安装尝试 ${attempt}/3 (packages: ${pkgs})"; \
+        if yum makecache --setopt=timeout=600 --setopt=minrate=0 --setopt=retries=10 \
+           && yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+                --setopt=timeout=600 --setopt=minrate=0 --setopt=retries=10 \
+                ${pkgs}; then \
+            ok=1; echo "::notice::yum 安装成功 (尝试 ${attempt})"; break; \
+        fi; \
+        echo "::warning::yum 第 ${attempt} 轮失败, 清理缓存后重试"; \
+        yum clean all 2>/dev/null || true; rm -rf /var/cache/yum /var/cache/dnf 2>/dev/null || true; \
+        sleep $((attempt * 15)); \
+    done; \
+    if [ "${ok}" != "1" ]; then echo "::error::yum 安装 3 轮均失败"; exit 1; fi; \
     \
     : "=== 按架构下载 Temurin JDK 25 tarball 并校验 ===" ; \
     case "$(uname -m)" in \
@@ -116,8 +130,9 @@ RUN set -eux; \
     JDK_INSTALL_DIR="/usr/lib/jvm"; \
     JAVA_HOME="/usr/lib/jvm/java"; \
     \
-    : "=== wget --progress dot:giga 与清华大学镜像下载 tarball ===" ; \
-    wget --progress dot:giga --output-document "/tmp/${JDK_TARBALL_NAME}" "$JDK_TARBALL_URL"; \
+    : "=== wget --progress dot:giga 下载 tarball (带 5 次重试, 境外链路易断) ===" ; \
+    wget --progress dot:giga --tries=5 --timeout=300 --waitretry=10 --retry-connrefused \
+         --output-document "/tmp/${JDK_TARBALL_NAME}" "$JDK_TARBALL_URL"; \
     \
     : "=== SHA256 校验: 摘要取自清华镜像目录的 SHA256SUMS (无 .asc 资产,这是官方提供的唯一校验手段) ===" ; \
     echo "${jdkSha}  /tmp/${JDK_TARBALL_NAME}" | sha256sum --check --strict -; \
@@ -214,21 +229,33 @@ RUN set -eux; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     sed -i 's/Version: 39\.2\.0/Version: 2026.10.10/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
     \
-    : "=== yum/dnf 网络调优 ===" ; \
+    : "=== yum/dnf 网络调优 (境外 runner 访问 UOS 源易断, minrate=0 不因低速中止) ===" ; \
     if [ -f /etc/yum.conf ]; then \
         sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
         if grep -q '^\[main\]' /etc/yum.conf; then \
-            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+            sed -i '/^\[main\]/a timeout=600\nminrate=0\nretries=10' /etc/yum.conf; \
         else \
-            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+            printf '\n[main]\ntimeout=600\nminrate=0\nretries=10\n' >> /etc/yum.conf; \
         fi; \
     fi; \
-    yum makecache; \
     \
     : "=== 运行时依赖: 官方 Alpine 镜像依赖全部覆盖; shadow-utils 用于 useradd ===" ; \
-    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        --setopt=timeout=300 --setopt=minrate=100 \
-        ca-certificates tar xz wget curl bash procps gnupg2 findutils shadow-utils hostname coreutils; \
+    : "带指数退避的重试循环: 最多 3 轮" ; \
+    pkgs='ca-certificates tar xz wget curl bash procps gnupg2 findutils shadow-utils hostname coreutils'; \
+    ok=0; \
+    for attempt in 1 2 3; do \
+        echo "::notice::yum 安装尝试 ${attempt}/3 (packages: ${pkgs})"; \
+        if yum makecache --setopt=timeout=600 --setopt=minrate=0 --setopt=retries=10 \
+           && yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+                --setopt=timeout=600 --setopt=minrate=0 --setopt=retries=10 \
+                ${pkgs}; then \
+            ok=1; echo "::notice::yum 安装成功 (尝试 ${attempt})"; break; \
+        fi; \
+        echo "::warning::yum 第 ${attempt} 轮失败, 清理缓存后重试"; \
+        yum clean all 2>/dev/null || true; rm -rf /var/cache/yum /var/cache/dnf 2>/dev/null || true; \
+        sleep $((attempt * 15)); \
+    done; \
+    if [ "${ok}" != "1" ]; then echo "::error::yum 安装 3 轮均失败"; exit 1; fi; \
     \
     : "=== 按架构下载 Temurin JRE 25 tarball 并校验 ===" ; \
     case "$(uname -m)" in \
@@ -241,7 +268,8 @@ RUN set -eux; \
     JDK_INSTALL_DIR="/usr/lib/jvm"; \
     JAVA_HOME="/usr/lib/jvm/java"; \
     \
-    wget --progress dot:giga --output-document "/tmp/${JRE_TARBALL_NAME}" "$JRE_TARBALL_URL"; \
+    wget --progress dot:giga --tries=5 --timeout=300 --waitretry=10 --retry-connrefused \
+         --output-document "/tmp/${JRE_TARBALL_NAME}" "$JRE_TARBALL_URL"; \
     echo "${jreSha}  /tmp/${JRE_TARBALL_NAME}" | sha256sum --check --strict -; \
     \
     mkdir -p "$JDK_INSTALL_DIR"; \
