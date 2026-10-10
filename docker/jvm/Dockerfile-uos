@@ -43,18 +43,23 @@
 
 ARG KAFKA_VERSION=4.3.1
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
-ARG JDK_VERSION=25.0.1_8
-ARG JRE_VERSION=25.0.1_8
+# 版本号需与清华镜像 Adoptium/25 目录下实际存在的 tarball 完全一致,
+# 否则 wget 会 404。当前镜像上提供的是 25.0.4.1_1 (见 SHA256SUMS)。
+ARG JDK_VERSION=25.0.4.1_1
+ARG JRE_VERSION=25.0.4.1_1
 
 # Adoptium OpenJDK 25 tarball 的清华镜像路径 (无 .asc 签名文件，使用 ARG SHA256 摘要校验)
-# 升级 JDK_VERSION / JRE_VERSION 时需同步更新以下四个摘要
+# 摘要由仓库 Secrets 注入 (workflow 通过 --build-arg 透传):
+#   JDK_TARBALL_SHA256_X86_64 / JDK_TARBALL_SHA256_AARCH64
+#   JRE_TARBALL_SHA256_X86_64 / JRE_TARBALL_SHA256_AARCH64
+# 升级 JDK_VERSION / JRE_VERSION 时需同步更新四个 secrets
 # 取自清华镜像目录下方的 SHA256SUMS 或 Adoptium release notes:
-#   ${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR}/<arch>/...
-#   ${JAVA_MIRROR_BASE_URL}/${JRE_SUBDIR}/<arch>/...
-ARG JDK_TARBALL_SHA256_X86_64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
-ARG JDK_TARBALL_SHA256_AARCH64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
-ARG JRE_TARBALL_SHA256_X86_64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
-ARG JRE_TARBALL_SHA256_AARCH64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
+#   ${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR}/<arch>/linux/...
+#   ${JAVA_MIRROR_BASE_URL}/${JRE_SUBDIR}/<arch>/linux/...
+ARG JDK_TARBALL_SHA256_X86_64=""
+ARG JDK_TARBALL_SHA256_AARCH64=""
+ARG JRE_TARBALL_SHA256_X86_64=""
+ARG JRE_TARBALL_SHA256_AARCH64=""
 
 # 通用 base URL (清华镜像,可通过 --build-arg 覆盖为华为云/阿里云等)
 # 完整 tarball URL = ${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR | JRE_SUBDIR}/<arch>/<tarball>
@@ -126,7 +131,7 @@ RUN set -eux; \
         *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
     esac; \
     JDK_TARBALL_NAME="OpenJDK25U-jdk_${jdkArch}_linux_hotspot_${JDK_VERSION}.tar.gz"; \
-    JDK_TARBALL_URL="${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR}/${jdkArch}/${JDK_TARBALL_NAME}"; \
+    JDK_TARBALL_URL="${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR}/${jdkArch}/linux/${JDK_TARBALL_NAME}"; \
     JDK_INSTALL_DIR="/usr/lib/jvm"; \
     JAVA_HOME="/usr/lib/jvm/java"; \
     \
@@ -160,7 +165,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java
 ENV PATH=$JAVA_HOME/bin:$PATH
 
 # 准备 Kafka 二进制 (build-jsa 阶段需要完整 Kafka 才能跑 jsa_launch)
-COPY jvm/jsa_launch /etc/kafka/docker/jsa_launch
+COPY launch jsa_launch /etc/kafka/docker/
 COPY server.properties /etc/kafka/docker/server.properties
 # context 根由 workflow 预置了 kafka.tgz 占位文件 (touch docker/kafka.tgz),
 # 使本行 glob 能匹配; 真正的 tarball 由下面的 RUN 用 wget 覆盖下载。
@@ -185,8 +190,10 @@ RUN set -eux; \
     tar xfz kafka.tgz -C /opt/kafka --strip-components 1; \
     rm -f kafka.tgz kafka.tgz.asc
 
-# 生成 jsa 归档 (kafka.jsa 与 storage.jsa)
-RUN /etc/kafka/docker/jsa_launch
+# 生成 jsa 归档 (kafka.jsa 与 storage.jsa, 落在 /opt/kafka 下)
+# 脚本失败时立即中断构建, 避免 Stage 2 的 COPY --from 才报 "not found"。
+RUN /etc/kafka/docker/jsa_launch \
+    && ls -l /opt/kafka/kafka.jsa /opt/kafka/storage.jsa
 
 ############################################
 # Stage 2: runtime — 最终运行镜像
@@ -264,7 +271,7 @@ RUN set -eux; \
         *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
     esac; \
     JRE_TARBALL_NAME="OpenJDK25U-jre_${jreArch}_linux_hotspot_${JRE_VERSION}.tar.gz"; \
-    JRE_TARBALL_URL="${JAVA_MIRROR_BASE_URL}/${JRE_SUBDIR}/${jreArch}/${JRE_TARBALL_NAME}"; \
+    JRE_TARBALL_URL="${JAVA_MIRROR_BASE_URL}/${JRE_SUBDIR}/${jreArch}/linux/${JRE_TARBALL_NAME}"; \
     JDK_INSTALL_DIR="/usr/lib/jvm"; \
     JAVA_HOME="/usr/lib/jvm/java"; \
     \
@@ -351,7 +358,7 @@ COPY server.properties /etc/kafka/docker/server.properties
 COPY --from=build-jsa kafka.jsa    /opt/kafka/kafka.jsa
 COPY --from=build-jsa storage.jsa  /opt/kafka/storage.jsa
 COPY --chown=appuser:appuser resources/common-scripts /etc/kafka/docker
-COPY --chown=appuser:appuser jvm/launch          /etc/kafka/docker/launch
+COPY --chown=appuser:appuser launch              /etc/kafka/docker/launch
 
 USER appuser
 
