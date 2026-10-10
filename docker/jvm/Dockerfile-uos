@@ -179,13 +179,30 @@ RUN set -eux; \
         wget --progress dot:giga --output-document kafka.tgz "$kafka_url"; \
         wget --progress dot:giga --output-document kafka.tgz.asc "$kafka_url.asc"; \
         \
-        : "=== PGP 校验: 导入 Apache Kafka Release Manager 公钥并验证 tarball ===" ; \
+        : "=== PGP 校验: 下载 Apache 官方 KEYS 并导入全部签名公钥 ===" ; \
+        : "不用 keyserver: hkps://keys.openpgp.org 对未公开邮箱的 key 返回 No data;" ; \
+        : "改为信任 Apache 官方发布渠道的 KEYS 文件 (含全部 Release Manager 公钥)。" ; \
+        KEYS_OK=0; \
+        for u in \
+            https://archive.apache.org/dist/kafka/KEYS \
+            https://downloads.apache.org/kafka/KEYS \
+            https://dlcdn.apache.org/kafka/KEYS \
+            https://mirrors.tuna.tsinghua.edu.cn/apache/kafka/KEYS \
+            https://mirrors.aliyun.com/apache/kafka/KEYS \
+        ; do \
+            if wget --progress dot:giga --timeout=30 --tries=2 --output-document KEYS "$u" 2>/dev/null \
+               && grep -q "BEGIN PGP PUBLIC KEY BLOCK" KEYS; then \
+                echo "KEYS 下载成功: $u"; KEYS_OK=1; break; \
+            fi; \
+            echo "KEYS 下载失败或内容非 PGP, 尝试下一个镜像: $u"; \
+        done; \
+        [ "$KEYS_OK" = "1" ] || { echo "错误: 所有镜像均无法获取有效 Apache KEYS 文件"; exit 1; }; \
         export GNUPGHOME="$(mktemp -d)"; \
-        gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys \
-            0x6BF18D4C92CA38A5 0x9B3B2484616BD7CB 0xA1C4E11FE0E7F6F7 0x1A39E07E8AA27D11; \
+        gpg --batch --import KEYS; \
         gpg --batch --verify kafka.tgz.asc kafka.tgz; \
         gpgconf --kill all; \
         rm -rf "$GNUPGHOME"; \
+        rm -f KEYS; \
     fi; \
     : "=== 解压 Kafka 到 /opt/kafka (strip-components=1 去掉顶层目录) ===" ; \
     tar xfz kafka.tgz -C /opt/kafka --strip-components 1; \
@@ -307,13 +324,28 @@ RUN set -eux; \
         wget --progress dot:giga --output-document kafka.tgz "$kafka_url"; \
         wget --progress dot:giga --output-document kafka.tgz.asc "$kafka_url.asc"; \
         \
-        : "=== PGP 校验 ===" ; \
+        : "=== PGP 校验: 同 Stage 1, 用 Apache 官方 KEYS 文件导入公钥 ===" ; \
+        KEYS_OK=0; \
+        for u in \
+            https://archive.apache.org/dist/kafka/KEYS \
+            https://downloads.apache.org/kafka/KEYS \
+            https://dlcdn.apache.org/kafka/KEYS \
+            https://mirrors.tuna.tsinghua.edu.cn/apache/kafka/KEYS \
+            https://mirrors.aliyun.com/apache/kafka/KEYS \
+        ; do \
+            if wget --progress dot:giga --timeout=30 --tries=2 --output-document KEYS "$u" 2>/dev/null \
+               && grep -q "BEGIN PGP PUBLIC KEY BLOCK" KEYS; then \
+                echo "KEYS 下载成功: $u"; KEYS_OK=1; break; \
+            fi; \
+            echo "KEYS 下载失败或内容非 PGP, 尝试下一个镜像: $u"; \
+        done; \
+        [ "$KEYS_OK" = "1" ] || { echo "错误: 所有镜像均无法获取有效 Apache KEYS 文件"; exit 1; }; \
         export GNUPGHOME="$(mktemp -d)"; \
-        gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys \
-            0x6BF18D4C92CA38A5 0x9B3B2484616BD7CB 0xA1C4E11FE0E7F6F7 0x1A39E07E8AA27D11; \
+        gpg --batch --import KEYS; \
         gpg --batch --verify kafka.tgz.asc kafka.tgz; \
         gpgconf --kill all; \
         rm -rf "$GNUPGHOME"; \
+        rm -f KEYS; \
     fi; \
     : "=== 解压 Kafka 到 /opt/kafka (strip-components=1 去掉顶层目录) ===" ; \
     tar xfz kafka.tgz -C /opt/kafka --strip-components 1; \
