@@ -165,9 +165,15 @@ ENV JAVA_HOME=/usr/lib/jvm/java
 ENV PATH=$JAVA_HOME/bin:$PATH
 
 # 准备 Kafka 二进制 (build-jsa 阶段需要完整 Kafka 才能跑 jsa_launch)
+#
+# 注意: COPY 会保留源文件的权限位。docker/jsa_launch 在 git 中以 100755 存储
+# (有执行位), 但为防 checkout 到不支持 x 位的文件系统 / CI 缓存导致权限丢失,
+# 下面显式 chmod 0755 —— 否则 RUN /etc/kafka/docker/jsa_launch 会报
+#   "/bin/sh: /etc/kafka/docker/jsa_launch: Permission denied" (exit 126)。
 COPY jsa_launch /etc/kafka/docker/jsa_launch
 COPY launch     /etc/kafka/docker/launch
 COPY server.properties /etc/kafka/docker/server.properties
+RUN chmod 0755 /etc/kafka/docker/jsa_launch /etc/kafka/docker/launch
 # context 根由 workflow 预置了 kafka.tgz 占位文件 (touch docker/kafka.tgz),
 # 使本行 glob 能匹配; 真正的 tarball 由下面的 RUN 用 wget 覆盖下载。
 COPY *kafka.tgz kafka.tgz
@@ -392,6 +398,10 @@ COPY --from=build-jsa kafka.jsa    /opt/kafka/kafka.jsa
 COPY --from=build-jsa storage.jsa  /opt/kafka/storage.jsa
 COPY --chown=appuser:appuser resources/common-scripts /etc/kafka/docker
 COPY --chown=appuser:appuser launch              /etc/kafka/docker/launch
+# 显式补执行位: CMD 直接执行 /etc/kafka/docker/run, 权限位丢失会报 126。
+# launch 由 run 用 '. ' (source) 加载, 不需要 x 位, 但一并补上无害。
+RUN chmod 0755 /etc/kafka/docker/run /etc/kafka/docker/configure \
+               /etc/kafka/docker/configureDefaults /etc/kafka/docker/launch
 
 USER appuser
 
