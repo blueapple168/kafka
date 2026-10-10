@@ -394,8 +394,12 @@ RUN set -eux; \
 
 # Kafka 启动脚本与配置 (沿用官方 common-scripts → configure → launch 链)
 COPY server.properties /etc/kafka/docker/server.properties
-COPY --from=build-jsa kafka.jsa    /opt/kafka/kafka.jsa
-COPY --from=build-jsa storage.jsa  /opt/kafka/storage.jsa
+# 注意: COPY --from=<stage> 的源路径相对的是该 stage 的 WORKDIR (未设置时为 /),
+# 官方 Dockerfile 写 `COPY --from=build-jsa kafka.jsa` 是因为官方 jsa_launch
+# 把归档输出到 CWD(=/)。本 Dockerfile 的 jsa_launch 输出到 /opt/kafka/,
+# 因此这里必须用绝对路径, 否则报: "/kafka.jsa": not found。
+COPY --from=build-jsa /opt/kafka/kafka.jsa    /opt/kafka/kafka.jsa
+COPY --from=build-jsa /opt/kafka/storage.jsa  /opt/kafka/storage.jsa
 COPY --chown=appuser:appuser resources/common-scripts /etc/kafka/docker
 COPY --chown=appuser:appuser launch              /etc/kafka/docker/launch
 # 显式补执行位: CMD 直接执行 /etc/kafka/docker/run, 权限位丢失会报 126。
