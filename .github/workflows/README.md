@@ -137,6 +137,55 @@ This one is straightforward. Using the "actions/stale" GitHub Action, we automat
 label and eventually close PRs which have not had activity for some time. See the
 [stale.yml](stale.yml) workflow file for specifics.
 
+### UOS 信创镜像构建与发布
+
+[docker_build_and_publish_uos.yml](docker_build_and_publish_uos.yml) 用于基于国产
+UOS 信创基础镜像 (`ghcr.io/blueapple168/uos-server-20-1070a`) 构建并发布 Apache Kafka
+镜像到 GitHub Container Registry (ghcr.io/blueapple168/kafka)。
+
+**与官方 Docker workflow 的差异**: 完全独立, 不调用 `docker/docker_build_test.py`、
+`docker/docker_release.py`、`docker/common.py` 等 Python 脚本, 也无 `docker_official_image_*.py`
+依赖; 直接使用 `docker buildx` 构建 + 推送 + Trivy CVE 扫描。 Dockerfile 共 2 份
+(与官方 Dockerfile 共存):
+
+- `docker/jvm/Dockerfile-uos` — Kafka on JVM (Temurin JDK/JRE 25, 包含两阶段 CDS 构建)
+- `docker/native/Dockerfile-uos` — Kafka on GraalVM Native Image (AOT 编译原生二进制)
+
+**Matrix 变体** (单 workflow 并行跑两个变体, 互不 cancel):
+
+| variant | Dockerfile | 默认 image tag | 运行时 | 是否需要 Temurin |
+| --- | --- | --- | --- | --- |
+| `jvm` | `docker/jvm/Dockerfile-uos` | `${KAFKA_VERSION}-uos` | Temurin JRE 25 | 是 |
+| `native` | `docker/native/Dockerfile-uos` | `${KAFKA_VERSION}-native-uos` | AOT 原生二进制 | 否 |
+
+**触发条件**:
+
+- `push` 到 `main` 分支, 且 `docker/jvm/**`、`docker/native/**`、
+  `docker/server.properties`、`docker/common-scripts/**`、`docker/resources/**` 或
+  本 workflow 文件变更
+- `workflow_dispatch` 手动触发, 可选指定 `kafka_url` 与 `image_tag`
+  (留空时, `jvm` 变体用 `${KAFKA_VERSION}-uos`, `native` 变体用 `${KAFKA_VERSION}-native-uos`)
+
+**仓库需配置的 Secrets** (jvm 变体必填, native 变体忽略):
+
+- `JDK_TARBALL_SHA256_X86_64` / `JDK_TARBALL_SHA256_AARCH64`
+- `JRE_TARBALL_SHA256_X86_64` / `JRE_TARBALL_SHA256_AARCH64`
+
+(摘要取自清华/华为云 Adoptium 镜像目录的 `SHA256SUMS`)
+
+**默认参数**:
+
+- `KAFKA_VERSION=4.3.1`
+- `kafka_url=https://archive.apache.org/dist/kafka/4.3.1/kafka_2.13-4.3.1.tgz`
+- `--platform linux/amd64,linux/arm64`
+
+**输出** (每个变体独立):
+
+- jvm    变体: 推送 `ghcr.io/blueapple168/kafka:4.3.1-uos`
+- native 变体: 推送 `ghcr.io/blueapple168/kafka:4.3.1-native-uos`
+- Trivy CVE 扫描报告 (CRITICAL+HIGH, `exit-code: '1'`, 严重漏洞阻断 workflow)
+- Artifacts: `scan_report_uos_jvm.txt` / `scan_report_uos_native.txt`
+
 ## GitHub Actions Quirks
 
 ### Composite Actions

@@ -1,0 +1,196 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 信创 (UOS) 基础镜像专用构建与发布 workflow。
+# 与 docker_build_and_test.yml / docker_rc_release.yml 完全独立:
+#   - 不调用 docker/docker_*.py 脚本,避免改动 docker_build_test.py / docker_release.py / common.py
+#   - 直接调用 docker buildx 构建 + 推送 + Trivy 扫描
+#   - 通过 matrix 同时构建两个变体 (jvm + native),两者独立并发、互不 cancel
+#       jvm    : docker/jvm/Dockerfile-uos    ->  ${KAFKA_VERSION}-uos
+#       native : docker/native/Dockerfile-uos ->  ${KAFKA_VERSION}-native-uos
+#   - 镜像仓库: ghcr.io/blueapple168/kafka
+#
+# 触发:
+#   1) push 到 main 分支, 且 docker/jvm/** / docker/native/** / docker/server.properties
+#      / docker/common-scripts/** / docker/resources/** 或本 workflow 文件变更
+#   2) workflow_dispatch 手动触发 (可选指定 kafka_url 与 image_tag,留空使用默认 ${KAFKA_VERSION}{suffix})
+#
+# 仓库需配置的 Secrets (jvm 变体必填, native 变体忽略):
+#   - JDK_TARBALL_SHA256_X86_64 / JDK_TARBALL_SHA256_AARCH64
+#   - JRE_TARBALL_SHA256_X86_64 / JRE_TARBALL_SHA256_AARCH64
+#
+# 推送目标: ghcr.io/blueapple168/kafka:<image_tag> (linux/amd64, linux/arm64)
+
+name: Docker Build and Publish (UOS)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docker/jvm/**'
+      - 'docker/native/**'
+      - 'docker/server.properties'
+      - 'docker/common-scripts/**'
+      - 'docker/resources/**'
+      - '.github/workflows/docker_build_and_publish_uos.yml'
+  workflow_dispatch:
+    inputs:
+      kafka_url:
+        description: Kafka tgz URL (留空使用默认 ${KAFKA_VERSION} release URL)
+        required: false
+        default: ''
+      image_tag:
+        description: 镜像 tag (留空使用 ${KAFKA_VERSION}{suffix}; suffix 取决于 variant: jvm=-uos, native=-native-uos)
+        required: false
+        default: ''
+
+jobs:
+  build-and-publish:
+    if: github.repository == 'blueapple168/kafka'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # variant 决定: Dockerfile 路径、默认 tag 后缀、是否校验 Temurin SHA256 secrets
+        variant: [jvm, native]
+    concurrency:
+      # 不同 variant 独立,避免 jvm 与 native 构建互相 cancel
+      group: docker-publish-uos-${{ matrix.variant }}-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      # Kafka 版本号集中维护: 升级 Kafka 时只需改这一处,
+      #   KAFKA_TARBALL_URL 与 IMAGE_TAG 默认值会在 Resolve 步骤里据此拼接
+      KAFKA_VERSION: '4.3.1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve Kafka URL
+        id: kafka-url
+        run: |
+          kafka_url="${{ github.event.inputs.kafka_url }}"
+          if [ -z "$kafka_url" ]; then
+            kafka_url="https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_2.13-${KAFKA_VERSION}.tgz"
+          fi
+          echo "url=$kafka_url" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve image tag
+        id: image-tag
+        run: |
+          image_tag="${{ github.event.inputs.image_tag }}"
+          if [ -z "$image_tag" ]; then
+            if [ "${{ matrix.variant }}" = "native" ]; then
+              image_tag="${KAFKA_VERSION}-native-uos"
+            else
+              image_tag="${KAFKA_VERSION}-uos"
+            fi
+          fi
+          echo "tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      # jvm 变体专属: 校验 Temurin tarball SHA256 secrets 已配置
+      # native 变体不需要 Temurin (运行的是 AOT 原生二进制),跳过此步
+      - name: Validate Temurin SHA256 secrets
+        if: matrix.variant == 'jvm'
+        env:
+          JDK_TARBALL_SHA256_X86_64: ${{ secrets.JDK_TARBALL_SHA256_X86_64 }}
+          JDK_TARBALL_SHA256_AARCH64: ${{ secrets.JDK_TARBALL_SHA256_AARCH64 }}
+          JRE_TARBALL_SHA256_X86_64: ${{ secrets.JRE_TARBALL_SHA256_X86_64 }}
+          JRE_TARBALL_SHA256_AARCH64: ${{ secrets.JRE_TARBALL_SHA256_AARCH64 }}
+        run: |
+          if [ -z "$JDK_TARBALL_SHA256_X86_64" ] || [ -z "$JDK_TARBALL_SHA256_AARCH64" ] \
+            || [ -z "$JRE_TARBALL_SHA256_X86_64" ] || [ -z "$JRE_TARBALL_SHA256_AARCH64" ]; then
+            echo "::error::One or more Temurin tarball SHA256 secrets are missing. Please configure:"
+            echo "::error::  - JDK_TARBALL_SHA256_X86_64 / JDK_TARBALL_SHA256_AARCH64"
+            echo "::error::  - JRE_TARBALL_SHA256_X86_64 / JRE_TARBALL_SHA256_AARCH64"
+            exit 1
+          fi
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        env:
+          KAFKA_URL: ${{ steps.kafka-url.outputs.url }}
+          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
+          JDK_TARBALL_SHA256_X86_64: ${{ secrets.JDK_TARBALL_SHA256_X86_64 }}
+          JDK_TARBALL_SHA256_AARCH64: ${{ secrets.JDK_TARBALL_SHA256_AARCH64 }}
+          JRE_TARBALL_SHA256_X86_64: ${{ secrets.JRE_TARBALL_SHA256_X86_64 }}
+          JRE_TARBALL_SHA256_AARCH64: ${{ secrets.JRE_TARBALL_SHA256_AARCH64 }}
+        run: |
+          set -eux
+          # variant -> Dockerfile 路径映射
+          if [ "${{ matrix.variant }}" = "native" ]; then
+            dockerfile='docker/native/Dockerfile-uos'
+            # native 不需要 Temurin SHA256 (运行时是 AOT 原生二进制,无 JDK/JRE)
+            extra_sha256_args=()
+          else
+            dockerfile='docker/jvm/Dockerfile-uos'
+            # jvm 需要把 Temurin SHA256 secrets 透传给 Dockerfile-uos 内的 ARG
+            if [ -z "$JDK_TARBALL_SHA256_X86_64" ] || [ -z "$JDK_TARBALL_SHA256_AARCH64" ] \
+              || [ -z "$JRE_TARBALL_SHA256_X86_64" ] || [ -z "$JRE_TARBALL_SHA256_AARCH64" ]; then
+              echo "::error::jvm 变体需要 JDK/JRE Tarball SHA256 secrets,但当前为空"
+              exit 1
+            fi
+            extra_sha256_args=(
+              --build-arg "JDK_TARBALL_SHA256_X86_64=${JDK_TARBALL_SHA256_X86_64}"
+              --build-arg "JDK_TARBALL_SHA256_AARCH64=${JDK_TARBALL_SHA256_AARCH64}"
+              --build-arg "JRE_TARBALL_SHA256_X86_64=${JRE_TARBALL_SHA256_X86_64}"
+              --build-arg "JRE_TARBALL_SHA256_AARCH64=${JRE_TARBALL_SHA256_AARCH64}"
+            )
+          fi
+
+          echo "::group::Building variant=${{ matrix.variant }} with ${dockerfile}"
+          docker buildx build \
+            -f "${dockerfile}" \
+            --build-arg "KAFKA_VERSION=${KAFKA_VERSION}" \
+            --build-arg "kafka_url=${KAFKA_URL}" \
+            "${extra_sha256_args[@]}" \
+            --build-arg "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --platform linux/amd64,linux/arm64 \
+            --tag "ghcr.io/blueapple168/kafka:${IMAGE_TAG}" \
+            --push \
+            docker/
+          echo "::endgroup::"
+
+      - name: Run CVE scan (Trivy)
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-type: 'image'
+          scan-ref: 'ghcr.io/blueapple168/kafka:${{ steps.image-tag.outputs.tag }}'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          output: 'scan_report_uos_${{ matrix.variant }}.txt'
+          exit-code: '1'
+
+      - name: Upload CVE scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan_report_uos_${{ matrix.variant }}.txt
+          path: scan_report_uos_${{ matrix.variant }}.txt

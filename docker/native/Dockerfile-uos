@@ -1,0 +1,179 @@
+# syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
+#
+# 参考官方镜像: https://github.com/apache/kafka (docker/native/Dockerfile)
+# 官方分两阶段:
+#   Stage 1 (build-native-image): ghcr.io/graalvm/graalvm-community:25
+#                                + native-image 工具链 + native-image-configs/
+#                                + native_command.sh + Apache Kafka tarball
+#                                -> 生成 /app/kafka/kafka.Kafka (AOT 编译原生二进制)
+#   Stage 2 (runtime):            alpine:latest + gcompat
+#                                + 直接运行 kafka.Kafka (无需 JVM)
+# 本文件适配 UOS Server 20 1070a (yum/dnf):
+#   - 阶段一: 保留 ghcr.io/graalvm/graalvm-community:25 (native-image 工具链复杂,
+#              临时构建容器不进入生产,最小化改动保持原状)
+#   - 阶段二: alpine:latest -> ghcr.io/blueapple168/uos-server-20-1070a:latest
+#              (UOS 本身就是 glibc 2.28,无需 gcompat 兼容层)
+#
+# 与官方的主要差异 (仅作用于 Stage 2 runtime):
+#   1. 基础镜像: alpine:latest -> ghcr.io/blueapple168/uos-server-20-1070a:latest
+#      (UOS Server 20, RHEL 8 兼容, glibc 2.28; native 二进制链接 glibc 即可直接运行)
+#   2. 包管理: apk add -> yum install,单次 yum 会话合并调优/装依赖/清理
+#   3. 移除 gcompat: UOS 自带 glibc 2.28,无需 musl 兼容层
+#   4. Alpine adduser -D -> shadow-utils 的 useradd (UID/GID 冲突时回退为系统自动分配)
+#   5. 时区与编码: 增加 TZ=Asia/Shanghai + LANG=C.UTF-8
+#   6. 移除 apk upgrade CVE 修复: UOS 基础镜像通常已修复
+#   7. 运行时不需 JDK/JRE (native 已经是 AOT 二进制),省去 Temurin 下载
+#
+# 构建流程:
+#   Stage 1 (AS build-native-image): 装 native-image 工具链 -> 解压 Kafka ->
+#     执行 native_command.sh 生成 kafka.Kafka 原生二进制
+#   Stage 2 (runtime):                创建 appuser 与目录 -> COPY 二进制与配置 ->
+#     切换 USER appuser -> CMD /etc/kafka/docker/run
+#
+# 版本对齐: GraalVM 25 (官方固定) + Apache Kafka 4.x (官方要求 Java 17+,GraalVM 25 自带 JDK 25)
+
+ARG KAFKA_VERSION=4.3.1
+ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
+
+############################################
+# Stage 1: build-native-image — 生成 kafka.Kafka 原生二进制
+# 保留官方 ghcr.io/graalvm/graalvm-community:25 (native-image 工具链依赖复杂)
+############################################
+
+FROM ghcr.io/graalvm/graalvm-community:25 AS build-native-image
+
+ARG KAFKA_VERSION
+ARG kafka_url=""
+
+LABEL stage=build-native-image
+
+WORKDIR /app
+
+ENV NATIVE_IMAGE_PATH="native-image"
+ENV KAFKA_DIR="/app/kafka"
+ENV NATIVE_CONFIGS_DIR="/app/native-image-configs"
+ENV KAFKA_LIBS_DIR="$KAFKA_DIR/libs"
+ENV TARGET_PATH="$KAFKA_DIR/kafka.Kafka"
+
+COPY native-image-configs $NATIVE_CONFIGS_DIR
+COPY native_command.sh native_command.sh
+
+COPY *kafka.tgz /app
+
+RUN set -eux; \
+    if [ -n "$kafka_url" ]; then \
+        microdnf install -y wget gnupg2; \
+        wget -nv -O kafka.tgz "$kafka_url"; \
+        wget -nv -O kafka.tgz.asc "$kafka_url.asc"; \
+        wget -nv -O KEYS https://downloads.apache.org/kafka/KEYS; \
+        gpg --import KEYS; \
+        gpg --batch --verify kafka.tgz.asc kafka.tgz; \
+    fi; \
+    mkdir $KAFKA_DIR; \
+    tar xfz kafka.tgz -C $KAFKA_DIR --strip-components 1; \
+    : "=== Build the native-binary of Apache Kafka using GraalVM native-image ===" ; \
+    /app/native_command.sh $NATIVE_IMAGE_PATH $NATIVE_CONFIGS_DIR $KAFKA_LIBS_DIR $TARGET_PATH; \
+    : "=== 清理 PGP 临时文件 ===" ; \
+    rm -f KEYS kafka.tgz.asc
+
+############################################
+# Stage 2: runtime — 最终运行镜像 (UOS 信创基础镜像)
+############################################
+
+FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG}
+
+ARG KAFKA_VERSION
+ARG build_date
+
+LABEL maintainer="blueapple" \
+        version="1.0" \
+        description="Apache Kafka ${KAFKA_VERSION} (GraalVM native, KRaft) on UOS 1070a" \
+        org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest" \
+        org.opencontainers.image.title="Apache Kafka (native)" \
+        org.opencontainers.image.version="${KAFKA_VERSION}" \
+        org.opencontainers.image.authors="Apache Kafka" \
+        org.label-schema.name="kafka-native" \
+        org.label-schema.description="Apache Kafka (GraalVM native)" \
+        org.label-schema.build-date="${build_date}" \
+        org.label-schema.vcs-url="https://github.com/apache/kafka"
+
+ENV TZ=Asia/Shanghai
+ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
+
+# Kafka broker PLAINTEXT (9092) 与 controller (9093, KRaft 模式)
+EXPOSE 9092 9093
+
+USER root
+
+# 单次 yum 会话: 调优 + 运行时依赖 + 清理
+# 运行时依赖: ca-certificates (TLS)、bash (scripts)、tzdata (时区)、tar/coreutils/findutils/hostname (scripts)
+# native 二进制不再需要 JVM/JDK,但 launch 脚本依赖 bash、ps 等
+RUN set -eux; \
+    echo "${TZ}" > /etc/timezone; \
+    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    sed -i 's/Version: 39\.2\.0/Version: 2026.10.10/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
+    \
+    : "=== yum/dnf 网络调优：默认 timeout=30s 太短，minrate=1000 容易在低速链路上触发下载中止 ===" ; \
+    if [ -f /etc/yum.conf ]; then \
+        sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
+        if grep -q '^\[main\]' /etc/yum.conf; then \
+            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+        else \
+            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+        fi; \
+    fi; \
+    yum makecache; \
+    \
+    : "=== 运行时依赖: native 二进制已静态链接 glibc,只需脚本与系统工具 ===" ; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+        --setopt=timeout=300 --setopt=minrate=100 \
+        ca-certificates tar bash tzdata coreutils findutils shadow-utils hostname; \
+    \
+    yum clean all; \
+    rm -rf /var/cache/yum /var/cache/dnf
+
+# 创建 Kafka 运行时目录与 appuser 系统用户 (UID/GID 冲突时回退为系统自动分配)
+RUN set -eux; \
+    mkdir -p /etc/kafka/docker /mnt/shared/config /opt/kafka/config /etc/kafka/secrets /opt/kafka/logs; \
+    \
+    if ! getent group appuser >/dev/null; then \
+        if getent group 1000 >/dev/null; then \
+            echo "::notice GID 1000 已被基础镜像占用,改用系统自动分配"; \
+            groupadd --system appuser; \
+        else \
+            groupadd --gid 1000 --system appuser; \
+        fi; \
+    fi; \
+    if ! id appuser >/dev/null 2>&1; then \
+        if id -u 1000 >/dev/null 2>&1; then \
+            echo "::notice UID 1000 已被基础镜像占用,改用系统自动分配"; \
+            useradd --system --home-dir /home/appuser --shell /bin/bash --gid appuser appuser; \
+        else \
+            useradd --uid 1000 --system --home-dir /home/appuser --shell /bin/bash --gid appuser appuser; \
+        fi; \
+    fi; \
+    chown -R appuser:root /etc/kafka /opt/kafka /mnt/shared/config; \
+    chmod -R ug+w /etc/kafka /opt/kafka /mnt/shared/config; \
+    \
+    : "=== 创建默认 /home/appuser 与 bash profile (官方 Alpine 用 -h /home/appuser) ===" ; \
+    mkdir -p /home/appuser; \
+    chown appuser:appuser /home/appuser; \
+    echo '. ~/.bashrc' > /home/appuser/.bash_profile; \
+    echo '. /etc/profile' > /home/appuser/.bashrc
+
+# Kafka 启动脚本与配置 (沿用 docker/ 根目录的 server.properties 与 common-scripts)
+# 启动时 launch 脚本调用 /opt/kafka/kafka.Kafka (Stage 1 生成的原生二进制)
+COPY server.properties /etc/kafka/docker/server.properties
+COPY --chown=appuser:root --from=build-native-image /app/kafka/kafka.Kafka         /opt/kafka/
+COPY --chown=appuser:root --from=build-native-image /app/kafka/config/log4j2.yaml   /etc/kafka/docker/
+COPY --chown=appuser:root --from=build-native-image /app/kafka/config/tools-log4j2.yaml /etc/kafka/docker/
+COPY --chown=appuser:root resources/common-scripts /etc/kafka/docker/
+COPY --chown=appuser:root launch /etc/kafka/docker/
+
+USER appuser
+
+# 数据/配置/证书目录建议挂载卷 (与官方一致)
+VOLUME ["/etc/kafka/secrets", "/mnt/shared/config"]
+
+CMD ["/etc/kafka/docker/run"]

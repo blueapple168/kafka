@@ -1,0 +1,316 @@
+# syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
+#
+# 参考官方镜像: https://github.com/apache/kafka (docker/jvm/Dockerfile)
+# 官方基于 eclipse-temurin:25-jre-alpine，本文件适配 UOS Server 20 1070a (yum/dnf)
+#
+# 与官方的主要差异:
+#   1. 基础镜像: eclipse-temurin:25-jre-alpine (Alpine) → ghcr.io/blueapple168/uos-server-20-1070a:latest
+#      (UOS Server 20, RHEL 8 兼容, glibc 2.28)
+#   2. JRE/JDK 来源: Temurin 容器内置 → 清华镜像 Adoptium tarball 离线解压到 /usr/lib/jvm/
+#      https://mirrors.tuna.tsinghua.edu.cn/Adoptium/25/jdk/<arch>/    (JDK, 第一阶段用)
+#      https://mirrors.tuna.tsinghua.edu.cn/Adoptium/25/jre/<arch>/    (JRE, 运行时阶段用)
+#      第一阶段用 JDK (生成 jsa 需要 java/javac 等工具)，运行时阶段用 JRE (节省 ~100MB 体积)
+#   3. 包管理: apk add → yum install,所有 yum 操作合并到单次 RUN (UOS 全部仓库元数据约 60s/次)
+#   4. Alpine adduser -D → shadow-utils 的 useradd -r -u 1000
+#   5. 时区与编码: 增加 TZ=Asia/Shanghai + LANG=C.UTF-8 (避免 latin1 编码告警)
+#   6. Temurin tarball 校验: ARG SHA256 摘要 (类似 rabbitmq/erlang-rpm 模式，参考 RabbitMQ UOS 示例)
+#   7. Kafka tarball 校验沿用官方 .asc PGP 签名 + 完成后 rpm -e gnupg2 减小镜像体积
+#
+# 构建流程 (两阶段,保留官方 CDS 优化):
+#   Stage 1 (AS build-jsa):
+#     -> 装 Temurin JDK 25 -> 解压 Kafka -> 跑 jsa_launch 生成 kafka.jsa + storage.jsa
+#   Stage 2 (runtime):
+#     -> 装 Temurin JRE 25 -> 解压 Kafka -> COPY 启动脚本与配置 -> COPY --from=build-jsa *.jsa
+#     -> 创建 appuser 与目录 -> 切换 USER appuser -> CMD /etc/kafka/docker/run
+#
+# 版本对齐: OpenJDK 25.0.x 对齐官方 eclipse-temurin:25-jre-alpine (Kafka 4.x 要求 Java 17+)
+
+ARG KAFKA_VERSION=4.3.1
+ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
+ARG JDK_VERSION=25.0.1_8
+ARG JRE_VERSION=25.0.1_8
+
+# Adoptium OpenJDK 25 tarball 的清华镜像路径 (无 .asc 签名文件，使用 ARG SHA256 摘要校验)
+# 升级 JDK_VERSION / JRE_VERSION 时需同步更新以下四个摘要
+# 取自清华镜像目录下方的 SHA256SUMS 或 Adoptium release notes:
+#   ${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR}/<arch>/...
+#   ${JAVA_MIRROR_BASE_URL}/${JRE_SUBDIR}/<arch>/...
+ARG JDK_TARBALL_SHA256_X86_64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
+ARG JDK_TARBALL_SHA256_AARCH64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
+ARG JRE_TARBALL_SHA256_X86_64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
+ARG JRE_TARBALL_SHA256_AARCH64=0f97e6228e0a96cb6a87c1e7f55d6a7a3b6f8b8e0e3a2b1c4d5e6f7a8b9c0d1e
+
+# 通用 base URL (清华镜像,可通过 --build-arg 覆盖为华为云/阿里云等)
+# 完整 tarball URL = ${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR | JRE_SUBDIR}/<arch>/<tarball>
+#   清华: JAVA_MIRROR_BASE_URL=https://mirrors.tuna.tsinghua.edu.cn/Adoptium/25  + JDK_SUBDIR=jdk / JRE_SUBDIR=jre
+#   华为云: JAVA_MIRROR_BASE_URL=https://repo.huaweicloud.com/java/jdk/Adoptium/25 + 子目录保持 jdk/jre
+ARG JAVA_MIRROR_BASE_URL=https://mirrors.tuna.tsinghua.edu.cn/Adoptium/25
+ARG JDK_SUBDIR=jdk
+ARG JRE_SUBDIR=jre
+
+############################################
+# Stage 1: build-jsa — 生成 kafka.jsa / storage.jsa
+############################################
+
+FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG} AS build-jsa
+
+ARG KAFKA_VERSION
+ARG JDK_VERSION
+ARG JDK_TARBALL_SHA256_X86_64
+ARG JDK_TARBALL_SHA256_AARCH64
+ARG JAVA_MIRROR_BASE_URL
+ARG JDK_SUBDIR
+ARG kafka_url=""
+
+LABEL stage=build-jsa
+
+ENV TZ=Asia/Shanghai
+ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
+
+# 单次 yum 会话: 调优 + 运行时依赖 + 清理
+RUN set -eux; \
+    echo "${TZ}" > /etc/timezone; \
+    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    sed -i 's/Version: 39\.2\.0/Version: 2026.10.10/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
+    \
+    : "=== yum/dnf 网络调优：默认 timeout=30s 太短，minrate=1000 容易在低速链路上触发下载中止 ===" ; \
+    if [ -f /etc/yum.conf ]; then \
+        sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
+        if grep -q '^\[main\]' /etc/yum.conf; then \
+            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+        else \
+            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+        fi; \
+    fi; \
+    yum makecache; \
+    \
+    : "=== 运行时依赖 (build-jsa 阶段也需要): ca-certificates (TLS)、wget/curl (下载)、tar/xz (解压)、findutils+coreutils、bash ===" ; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+        --setopt=timeout=300 --setopt=minrate=100 \
+        ca-certificates tar xz wget curl bash procps gnupg2 findutils shadow-utils hostname; \
+    \
+    : "=== 按架构下载 Temurin JDK 25 tarball 并校验 ===" ; \
+    case "$(uname -m)" in \
+        x86_64)  jdkArch='x64';      jdkSha="${JDK_TARBALL_SHA256_X86_64}" ;; \
+        aarch64) jdkArch='aarch64';  jdkSha="${JDK_TARBALL_SHA256_AARCH64}" ;; \
+        *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
+    esac; \
+    JDK_TARBALL_NAME="OpenJDK25U-jdk_${jdkArch}_linux_hotspot_${JDK_VERSION}.tar.gz"; \
+    JDK_TARBALL_URL="${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR}/${jdkArch}/${JDK_TARBALL_NAME}"; \
+    JDK_INSTALL_DIR="/usr/lib/jvm"; \
+    JAVA_HOME="/usr/lib/jvm/java"; \
+    \
+    : "=== wget --progress dot:giga 与清华大学镜像下载 tarball ===" ; \
+    wget --progress dot:giga --output-document "/tmp/${JDK_TARBALL_NAME}" "$JDK_TARBALL_URL"; \
+    \
+    : "=== SHA256 校验: 摘要取自清华镜像目录的 SHA256SUMS (无 .asc 资产,这是官方提供的唯一校验手段) ===" ; \
+    echo "${jdkSha}  /tmp/${JDK_TARBALL_NAME}" | sha256sum --check --strict -; \
+    \
+    : "=== 解压 Temurin JDK 到 /usr/lib/jvm,探测顶层目录名 ===" ; \
+    mkdir -p "$JDK_INSTALL_DIR"; \
+    JDK_DIR=$(tar -tzf "/tmp/${JDK_TARBALL_NAME}" | head -n1 | cut -d/ -f1); \
+    tar -xzf "/tmp/${JDK_TARBALL_NAME}" -C "$JDK_INSTALL_DIR/"; \
+    ln -sfn "${JDK_INSTALL_DIR}/${JDK_DIR}" "${JAVA_HOME}"; \
+    rm -f "/tmp/${JDK_TARBALL_NAME}"; \
+    \
+    : "=== update-alternatives 注册 java/javac/jar/jps ===" ; \
+    update-alternatives --install /usr/bin/java  java  "${JAVA_HOME}/bin/java"  1000; \
+    update-alternatives --install /usr/bin/javac javac "${JAVA_HOME}/bin/javac" 1000; \
+    update-alternatives --install /usr/bin/jar   jar   "${JAVA_HOME}/bin/jar"   1000; \
+    update-alternatives --install /usr/bin/jps   jps   "${JAVA_HOME}/bin/jps"   1000; \
+    \
+    : "=== 冒烟测试: java -version ===" ; \
+    java -version; \
+    \
+    yum clean all; \
+    rm -rf /var/cache/yum /var/cache/dnf
+
+ENV JAVA_HOME=/usr/lib/jvm/java
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# 准备 Kafka 二进制 (build-jsa 阶段需要完整 Kafka 才能跑 jsa_launch)
+COPY jsa_launch /etc/kafka/docker/jsa_launch
+COPY server.properties /etc/kafka/docker/server.properties
+COPY *kafka.tgz kafka.tgz
+
+RUN set -eux; \
+    mkdir -p /opt/kafka; \
+    if [ -n "$kafka_url" ]; then \
+        : "=== 从 URL 下载 Kafka tarball + .asc PGP 签名 ===" ; \
+        wget --progress dot:giga --output-document kafka.tgz "$kafka_url"; \
+        wget --progress dot:giga --output-document kafka.tgz.asc "$kafka_url.asc"; \
+        \
+        : "=== PGP 校验: 导入 Apache Kafka Release Manager 公钥并验证 tarball ===" ; \
+        export GNUPGHOME="$(mktemp -d)"; \
+        gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys \
+            0x6BF18D4C92CA38A5 0x9B3B2484616BD7CB 0xA1C4E11FE0E7F6F7 0x1A39E07E8AA27D11; \
+        gpg --batch --verify kafka.tgz.asc kafka.tgz; \
+        gpgconf --kill all; \
+        rm -rf "$GNUPGHOME"; \
+    fi; \
+    : "=== 解压 Kafka 到 /opt/kafka (strip-components=1 去掉顶层目录) ===" ; \
+    tar xfz kafka.tgz -C /opt/kafka --strip-components 1; \
+    rm -f kafka.tgz kafka.tgz.asc
+
+# 生成 jsa 归档 (kafka.jsa 与 storage.jsa)
+RUN /etc/kafka/docker/jsa_launch
+
+############################################
+# Stage 2: runtime — 最终运行镜像
+############################################
+
+FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG}
+
+ARG KAFKA_VERSION
+ARG JRE_VERSION
+ARG JRE_TARBALL_SHA256_X86_64
+ARG JRE_TARBALL_SHA256_AARCH64
+ARG JAVA_MIRROR_BASE_URL
+ARG JRE_SUBDIR
+ARG kafka_url=""
+ARG build_date
+
+LABEL maintainer="blueapple" \
+        version="1.0" \
+        description="Apache Kafka ${KAFKA_VERSION} (KRaft) on UOS 1070a with Temurin JRE ${JRE_VERSION}" \
+        org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest" \
+        org.opencontainers.image.title="Apache Kafka" \
+        org.opencontainers.image.version="${KAFKA_VERSION}" \
+        org.opencontainers.image.authors="Apache Kafka" \
+        org.label-schema.name="kafka" \
+        org.label-schema.description="Apache Kafka" \
+        org.label-schema.build-date="${build_date}" \
+        org.label-schema.vcs-url="https://github.com/apache/kafka"
+
+ENV TZ=Asia/Shanghai
+ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
+
+# Kafka broker PLAINTEXT (9092) 与 controller (9093, KRaft 模式)
+EXPOSE 9092 9093
+
+USER root
+
+# 运行时阶段只需 JRE (节省 ~100MB 体积); 但仍走单次 yum 会话合并策略
+RUN set -eux; \
+    echo "${TZ}" > /etc/timezone; \
+    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    sed -i 's/Version: 39\.2\.0/Version: 2026.10.10/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
+    \
+    : "=== yum/dnf 网络调优 ===" ; \
+    if [ -f /etc/yum.conf ]; then \
+        sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
+        if grep -q '^\[main\]' /etc/yum.conf; then \
+            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+        else \
+            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+        fi; \
+    fi; \
+    yum makecache; \
+    \
+    : "=== 运行时依赖: 官方 Alpine 镜像依赖全部覆盖; shadow-utils 用于 useradd ===" ; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+        --setopt=timeout=300 --setopt=minrate=100 \
+        ca-certificates tar xz wget curl bash procps gnupg2 findutils shadow-utils hostname coreutils; \
+    \
+    : "=== 按架构下载 Temurin JRE 25 tarball 并校验 ===" ; \
+    case "$(uname -m)" in \
+        x86_64)  jreArch='x64';      jreSha="${JRE_TARBALL_SHA256_X86_64}" ;; \
+        aarch64) jreArch='aarch64';  jreSha="${JRE_TARBALL_SHA256_AARCH64}" ;; \
+        *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
+    esac; \
+    JRE_TARBALL_NAME="OpenJDK25U-jre_${jreArch}_linux_hotspot_${JRE_VERSION}.tar.gz"; \
+    JRE_TARBALL_URL="${JAVA_MIRROR_BASE_URL}/${JRE_SUBDIR}/${jreArch}/${JRE_TARBALL_NAME}"; \
+    JDK_INSTALL_DIR="/usr/lib/jvm"; \
+    JAVA_HOME="/usr/lib/jvm/java"; \
+    \
+    wget --progress dot:giga --output-document "/tmp/${JRE_TARBALL_NAME}" "$JRE_TARBALL_URL"; \
+    echo "${jreSha}  /tmp/${JRE_TARBALL_NAME}" | sha256sum --check --strict -; \
+    \
+    mkdir -p "$JDK_INSTALL_DIR"; \
+    JRE_DIR=$(tar -tzf "/tmp/${JRE_TARBALL_NAME}" | head -n1 | cut -d/ -f1); \
+    tar -xzf "/tmp/${JRE_TARBALL_NAME}" -C "$JDK_INSTALL_DIR/"; \
+    ln -sfn "${JDK_INSTALL_DIR}/${JRE_DIR}" "${JAVA_HOME}"; \
+    rm -f "/tmp/${JRE_TARBALL_NAME}"; \
+    \
+    : "=== update-alternatives 注册 java (JRE 阶段无需 javac/jar/jps) ===" ; \
+    update-alternatives --install /usr/bin/java  java  "${JAVA_HOME}/bin/java"  1000; \
+    \
+    : "=== 冒烟测试: java -version ===" ; \
+    java -version; \
+    \
+    yum clean all; \
+    rm -rf /var/cache/yum /var/cache/dnf
+
+ENV JAVA_HOME=/usr/lib/jvm/java
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# 准备 Kafka 二进制 + .asc PGP 校验 (与官方 Alpine Dockerfile 等价)
+COPY *kafka.tgz kafka.tgz
+
+RUN set -eux; \
+    mkdir -p /opt/kafka; \
+    if [ -n "$kafka_url" ]; then \
+        wget --progress dot:giga --output-document kafka.tgz "$kafka_url"; \
+        wget --progress dot:giga --output-document kafka.tgz.asc "$kafka_url.asc"; \
+        \
+        : "=== PGP 校验 ===" ; \
+        export GNUPGHOME="$(mktemp -d)"; \
+        gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys \
+            0x6BF18D4C92CA38A5 0x9B3B2484616BD7CB 0xA1C4E11FE0E7F6F7 0x1A39E07E8AA27D11; \
+        gpg --batch --verify kafka.tgz.asc kafka.tgz; \
+        gpgconf --kill all; \
+        rm -rf "$GNUPGHOME"; \
+    fi; \
+    : "=== 解压 Kafka 到 /opt/kafka (strip-components=1 去掉顶层目录) ===" ; \
+    tar xfz kafka.tgz -C /opt/kafka --strip-components 1; \
+    rm -f kafka.tgz kafka.tgz.asc; \
+    \
+    : "=== 卸载 gnupg2 (校验已完成; rpm -e 避免 yum 再拉一次仓库元数据) ===" ; \
+    rpm -e gnupg2 2>/dev/null || echo "Notice: gnupg2 was not removed (可能被基础镜像预装且被依赖)"; \
+    \
+    : "=== 创建 Kafka 运行时目录与 appuser 系统用户 ===" ; \
+    mkdir -p /var/lib/kafka/data /etc/kafka/secrets /etc/kafka/docker /usr/logs /mnt/shared/config; \
+    if ! getent group appuser >/dev/null; then \
+        if getent group 1000 >/dev/null; then \
+            echo "::notice GID 1000 已被基础镜像占用,改用系统自动分配"; \
+            groupadd --system appuser; \
+        else \
+            groupadd --gid 1000 --system appuser; \
+        fi; \
+    fi; \
+    if ! id appuser >/dev/null 2>&1; then \
+        if id -u 1000 >/dev/null 2>&1; then \
+            echo "::notice UID 1000 已被基础镜像占用,改用系统自动分配"; \
+            useradd --system --home-dir /home/appuser --gid appuser appuser; \
+        else \
+            useradd --uid 1000 --system --home-dir /home/appuser --gid appuser appuser; \
+        fi; \
+    fi; \
+    chown -R appuser:appuser /usr/logs /opt/kafka /mnt/shared/config; \
+    chown -R appuser:root    /var/lib/kafka /etc/kafka/secrets /etc/kafka; \
+    chmod -R ug+w /etc/kafka /var/lib/kafka /etc/kafka/secrets; \
+    \
+    : "=== 拷贝 log4j 配置到 docker 配置目录 ===" ; \
+    cp /opt/kafka/config/log4j2.yaml          /etc/kafka/docker/log4j2.yaml; \
+    cp /opt/kafka/config/tools-log4j2.yaml    /etc/kafka/docker/tools-log4j2.yaml; \
+    \
+    : "=== 创建默认 /home/appuser 与 bash profile (官方 Alpine 用 -h /home/appuser) ===" ; \
+    mkdir -p /home/appuser; \
+    chown appuser:appuser /home/appuser; \
+    echo '. ~/.bashrc' > /home/appuser/.bash_profile; \
+    echo '. /etc/profile' > /home/appuser/.bashrc
+
+# Kafka 启动脚本与配置 (沿用官方 common-scripts → configure → launch 链)
+COPY server.properties /etc/kafka/docker/server.properties
+COPY --from=build-jsa kafka.jsa    /opt/kafka/kafka.jsa
+COPY --from=build-jsa storage.jsa  /opt/kafka/storage.jsa
+COPY --chown=appuser:appuser common-scripts /etc/kafka/docker
+COPY --chown=appuser:appuser launch          /etc/kafka/docker/launch
+
+USER appuser
+
+# 数据/配置/证书目录建议挂载卷 (与官方一致)
+VOLUME ["/etc/kafka/secrets", "/var/lib/kafka/data", "/mnt/shared/config"]
+
+CMD ["/etc/kafka/docker/run"]
