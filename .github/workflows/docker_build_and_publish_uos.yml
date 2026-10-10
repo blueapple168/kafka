@@ -222,6 +222,20 @@ jobs:
           # 且报告文件可能尚未落盘 -> 后续 Upload 步骤报 "No files were found"。
           # 改为 '0': 扫描结果只作为报告产出, 不阻断发布 (由人工审查).
           exit-code: '0'
+          # 关键: 显式声明被扫描镜像的平台。
+          # action 内部会 `docker pull $scanRef` + `docker save`, 若不指定平台,
+          # docker 按 runner 架构(amd64)解析 manifest, 遇到 arm64 单架构镜像会报
+          #   no matching manifest for linux/amd64 in the manifest list entries
+          # (这正是 jvm/native arm64 job 在 Trivy 步骤失败的原因)。
+          # trivy-env 透传 TRIVY_PLATFORM 进沙箱容器, 覆盖 Trivy 默认的 runtime
+          # 平台推导 (Trivy 约定: 任意 CLI flag 可用 TRIVY_<FLAG> 环境变量设置)。
+          trivy-env: |
+            TRIVY_PLATFORM=${{ matrix.platform }}
+        # step 级 env: 作用到 action 的 entrypoint.sh, 覆盖它内部的
+        # `docker pull` / `docker save` / `docker run`, 确保取到 arm64 镜像层。
+        # 注意: env 必须与 with 同级, 不能写进 with 块内部。
+        env:
+          DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
 
       - name: Upload CVE scan report
         if: always()
