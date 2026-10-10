@@ -71,9 +71,11 @@ ENV NATIVE_CONFIGS_DIR="/app/native-image-configs"
 ENV KAFKA_LIBS_DIR="$KAFKA_DIR/libs"
 ENV TARGET_PATH="$KAFKA_DIR/kafka.Kafka"
 
-COPY native-image-configs $NATIVE_CONFIGS_DIR
-COPY native_command.sh native_command.sh
+COPY native/native-image-configs $NATIVE_CONFIGS_DIR
+COPY native/native_command.sh native_command.sh
 
+# context 根由 workflow 预置了 kafka.tgz 占位文件 (touch docker/kafka.tgz),
+# 使本行 glob 能匹配; 真正的 tarball 由下面的 RUN 用 wget 覆盖下载。
 COPY *kafka.tgz /app
 
 RUN set -eux; \
@@ -184,7 +186,7 @@ COPY --chown=appuser:root --from=build-native-image /app/kafka/kafka.Kafka      
 COPY --chown=appuser:root --from=build-native-image /app/kafka/config/log4j2.yaml   /etc/kafka/docker/
 COPY --chown=appuser:root --from=build-native-image /app/kafka/config/tools-log4j2.yaml /etc/kafka/docker/
 COPY --chown=appuser:root resources/common-scripts /etc/kafka/docker/
-COPY --chown=appuser:root launch /etc/kafka/docker/
+COPY --chown=appuser:root native/launch /etc/kafka/docker/
 
 USER appuser
 
