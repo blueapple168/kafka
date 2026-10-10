@@ -23,7 +23,7 @@
 #   - 镜像仓库: ghcr.io/blueapple168/kafka
 #
 # 触发:
-#   1) push 到 main 分支, 且 docker/jvm/** / docker/native/** / docker/server.properties
+#   1) push 到 trunk 分支 (本仓库主分支), 且 docker/jvm/** / docker/native/** / docker/server.properties
 #      / docker/common-scripts/** / docker/resources/** 或本 workflow 文件变更
 #   2) workflow_dispatch 手动触发 (可选指定 kafka_url 与 image_tag,留空使用默认 ${KAFKA_VERSION}{suffix})
 #
@@ -38,7 +38,7 @@ name: Docker Build and Publish (UOS)
 on:
   push:
     branches:
-      - main
+      - trunk
     paths:
       - 'docker/jvm/**'
       - 'docker/native/**'

@@ -160,7 +160,7 @@ UOS 信创基础镜像 (`ghcr.io/blueapple168/uos-server-20-1070a`) 构建并发
 
 **触发条件**:
 
-- `push` 到 `main` 分支, 且 `docker/jvm/**`、`docker/native/**`、
+- `push` 到 `trunk` 分支, 且 `docker/jvm/**`、`docker/native/**`、
   `docker/server.properties`、`docker/common-scripts/**`、`docker/resources/**` 或
   本 workflow 文件变更
 - `workflow_dispatch` 手动触发, 可选指定 `kafka_url` 与 `image_tag`
