@@ -42,6 +42,8 @@ on:
     paths:
       - 'docker/jvm/**'
       - 'docker/native/**'
+      - 'docker/launch'
+      - 'docker/jsa_launch'
       - 'docker/server.properties'
       - 'docker/common-scripts/**'
       - 'docker/resources/**'
