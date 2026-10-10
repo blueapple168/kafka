@@ -53,7 +53,7 @@ on:
         required: false
         default: ''
       image_tag:
-        description: '镜像 tag (留空使用 ${KAFKA_VERSION}{suffix}; suffix 取决于 variant: jvm=-uos, native=-native-uos)'
+        description: '镜像 tag（留空时由 variant 自动决定后缀：jvm=-uos，native=-native-uos）'
         required: false
         default: ''
 
