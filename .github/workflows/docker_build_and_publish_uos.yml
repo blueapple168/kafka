@@ -62,7 +62,18 @@ on:
 jobs:
   build-and-publish:
     if: github.repository == 'blueapple168/kafka'
-    runs-on: ubuntu-latest
+    # 按目标平台选择 runner 架构:
+    #   amd64 -> ubuntu-latest (x64)     原生构建
+    #   arm64 -> ubuntu-24.04-arm (arm64) 原生构建
+    # 关键: arm64 必须用原生 arm64 runner, 不能用 QEMU 模拟。
+    # 原因: native 变体的 GraalVM native-image 编译是 CPU/内存密集的长时间操作,
+    # 在 QEMU 模拟下 `[6/8] Compiling methods...` 单步就耗时 5904.9s(98min),
+    # 整体 `Finished generating 'kafka.Kafka' in 253m 3s`(4.2h), 叠加构建/推送/
+    # 拉取/扫描后总时长逼近 GitHub 默认 6h job 上限, 导致 job 被 cancel
+    # (attempt 2 实测生命期 6h00m28s 被砍)。改用原生 arm64 runner 后,
+    # 编译按真实 CPU 执行, 耗时降到分钟级。
+    # (GitHub 对 public 仓库的 arm64 runner 免费且不限量)
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -72,15 +83,22 @@ jobs:
         # variant 决定: Dockerfile 路径、默认 tag 后缀、是否校验 Temurin SHA256 secrets
         variant: [jvm, native]
         # platform 作为独立维度: amd64 与 arm64 拆成不同 job,互不拖累。
-        # 原因: arm64 在 GitHub runner 上走 QEMU 模拟,访问 UOS 官方源
-        # (enterprise-c-packages.chinauos.com) 下载 aarch64 包时, 偶发
-        # SSL 断连(35)/空响应(52)/低速超时(28)。若与 amd64 同 job 双平台构建,
-        # arm64 失败会连带丢弃 amd64 已构建成果。拆开后各自独立重试。
+        # 原因: 若与 amd64 同 job 双平台构建, arm64 失败会连带丢弃 amd64 已构建成果。
+        # 拆开后各自独立重试。
         platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     concurrency:
       # 不同 variant × platform 独立,避免互相 cancel
       group: docker-publish-uos-${{ matrix.variant }}-${{ matrix.platform }}-${{ github.ref }}
       cancel-in-progress: true
+    # 显式超时, 避免 job 卡死时被 GitHub 6h 上限静默 cancel(状态一直挂在 in_progress)。
+    # 原生 runner 下 native 变体约 20-30min, 给足余量到 150min;
+    # 超时即明确 failure, 比"永远 in_progress"更利于排查。
+    timeout-minutes: 150
     env:
       # Kafka 版本号集中维护: 升级 Kafka 时只需改这一处,
       #   KAFKA_TARBALL_URL 与 IMAGE_TAG 默认值会在 Resolve 步骤里据此拼接
@@ -90,6 +108,14 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set up QEMU
+        # 仅在 runner 架构 ≠ 目标平台架构时才需要 QEMU 模拟。
+        # 当前 matrix 已把 runner 与 platform 一一对齐
+        #   linux/amd64 -> ubuntu-latest (x64)      原生
+        #   linux/arm64 -> ubuntu-24.04-arm (arm64) 原生
+        # 因此两个 job 都不会命中此条件, QEMU 实际被完全跳过。
+        # 保留该步骤是为了: 若将来把某平台改回 x64 runner 跑跨架构构建,
+        # 该步骤会自动补上 QEMU, 无需再改 workflow。
+        if: matrix.runner != 'ubuntu-24.04-arm' && matrix.platform == 'linux/arm64'
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
 
       - name: Set up Docker Buildx
