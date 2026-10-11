@@ -61,7 +61,13 @@ on:
 
 jobs:
   build-and-publish:
-    if: github.repository == 'blueapple168/kafka'
+    # 只在"本仓库"跑, 避免 fork 出去后别人的 push 也触发构建/推送 ghcr。
+    # 用 github.repository_id 而非 github.repository (名字):
+    # 仓库已由 blueapple168/kafka 改名为 blueapple168/kafka-docker,
+    # 名字判断 `github.repository == 'blueapple168/kafka'` 会变成 false,
+    # 导致整个 job 被静默 skip (run 38125744388 就是这样被跳过的)。
+    # repository_id 是数字 ID, 改名不变, 更稳。
+    if: github.repository_id == '1412943752'
     # 按目标平台选择 runner 架构:
     #   amd64 -> ubuntu-latest (x64)     原生构建
     #   arm64 -> ubuntu-24.04-arm (arm64) 原生构建
@@ -276,7 +282,8 @@ jobs:
   # 失败时, 不会连带阻止其它 variant 的 manifest 合并。
   # 合并前显式检查两个 arch tag 是否都已存在于 registry, 缺一即跳过并给出提示。
   merge-manifest:
-    if: ${{ always() && github.repository == 'blueapple168/kafka' }}
+    # 与 build-and-publish 同样用数字 repository_id 判断 (改名免疫)。
+    if: ${{ always() && github.repository_id == '1412943752' }}
     needs: build-and-publish
     runs-on: ubuntu-latest
     permissions:
